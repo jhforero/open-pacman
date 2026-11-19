@@ -110,35 +110,165 @@ function movePacman( game ) {
   wrapTunnel( p, width );
 }
 
-function decideGhost( game, g ) {
-  const grid = game.grid;
-  const p = game.pacman;
-
-  const options = Object.keys( DIRS ).filter(
-    ( dir ) => dir !== OPPOSITE[ g.dir ] && canMove( grid, g.x, g.y, dir, 'ghost' )
-  );
-  // Sin salida (callejon): permitir el giro de 180.
-  const choices = options.length ? options : [ '' + OPPOSITE[ g.dir ] ];
-
-  if ( g.kind === 'hunter' ) {
-    const px = Math.round( p.x );
-    const py = Math.round( p.y );
-    let best = choices[ 0 ];
-    let bestDist = Infinity;
-    for ( const dir of choices ) {
-      const d = DIRS[ dir ];
-      const nx = g.x + d.x;
-      const ny = g.y + d.y;
-      const dist = Math.abs( nx - px ) + Math.abs( ny - py );
-      if ( dist < bestDist ) {
-        bestDist = dist;
-        best = dir;
-      }
-    }
-    g.dir = best;
-  } else {
-    g.dir = choices[ Math.floor( Math.random() * choices.length ) ];
+// Orden de exploracion: direccion actual, giros y por ultimo la inversa.
+function neighborDirs( currentDir ) {
+  const opposite = OPPOSITE[ currentDir ];
+  const order = [];
+  if ( currentDir ) order.push( currentDir );
+  for ( const dir of Object.keys( DIRS ) ) {
+    if ( dir !== currentDir && dir !== opposite ) order.push( dir );
   }
+  if ( opposite && opposite !== currentDir ) order.push( opposite );
+  return order;
+}
+
+// Celda vecina transitable para un fantasma (puerta 3 y tunel incluidos).
+function ghostStepCell( grid, x, y, dir ) {
+  if ( !canMove( grid, x, y, dir, 'ghost' ) ) return null;
+  const d = DIRS[ dir ];
+  const width = grid[ 0 ].length;
+  let nx = x + d.x;
+  const ny = y + d.y;
+  if ( ny === TUNNEL_ROW && ( nx < 0 || nx >= width ) ) nx = ( nx + width ) % width;
+  return { x: nx, y: ny };
+}
+
+function fallbackDir( grid, x, y, preferred ) {
+  if ( preferred && canMove( grid, x, y, preferred, 'ghost' ) ) return preferred;
+  return Object.keys( DIRS ).find( ( dir ) => canMove( grid, x, y, dir, 'ghost' ) ) || preferred;
+}
+
+// Primer paso de un camino minimo hasta 'to'. Si el objetivo es inalcanzable
+// (pared), se dirige a la celda alcanzable mas cercana.
+function shortestPathStep( grid, from, to, currentDir ) {
+  const H = grid.length;
+  const W = grid[ 0 ].length;
+  const clampX = ( v ) => Math.max( 0, Math.min( W - 1, Math.round( v ) ) );
+  const clampY = ( v ) => Math.max( 0, Math.min( H - 1, Math.round( v ) ) );
+  const sx = clampX( from.x );
+  const sy = clampY( from.y );
+  const gx = clampX( to.x );
+  const gy = clampY( to.y );
+  const startKey = sy * W + sx;
+  const goalKey = gy * W + gx;
+  const order = neighborDirs( currentDir );
+  const fallback = () => fallbackDir( grid, sx, sy, currentDir );
+
+  if ( startKey === goalKey ) return fallback();
+
+  const depth = new Map( [ [ startKey, 0 ] ] );
+  const prev = new Map();
+  const queue = [ startKey ];
+  let head = 0;
+  while ( head < queue.length ) {
+    const key = queue[ head++ ];
+    const x = key % W;
+    const y = Math.floor( key / W );
+    const nextDepth = depth.get( key ) + 1;
+    for ( const dir of order ) {
+      const cell = ghostStepCell( grid, x, y, dir );
+      if ( !cell ) continue;
+      const nk = cell.y * W + cell.x;
+      if ( depth.has( nk ) ) continue;
+      depth.set( nk, nextDepth );
+      prev.set( nk, { key, dir } );
+      queue.push( nk );
+    }
+  }
+
+  // Distancias desde el objetivo; si cae en una pared, desde sus vecinos libres.
+  const sources = [];
+  if ( !isWall( grid, gx, gy, 'ghost' ) ) {
+    sources.push( goalKey );
+  } else {
+    for ( const dir of Object.keys( DIRS ) ) {
+      const cell = ghostStepCell( grid, gx, gy, dir );
+      if ( cell ) sources.push( cell.y * W + cell.x );
+    }
+  }
+  if ( !sources.length ) return fallback();
+
+  const goalDist = new Map();
+  const goalQueue = [];
+  for ( const key of sources ) {
+    if ( goalDist.has( key ) ) continue;
+    goalDist.set( key, 0 );
+    goalQueue.push( key );
+  }
+  let goalHead = 0;
+  while ( goalHead < goalQueue.length ) {
+    const key = goalQueue[ goalHead++ ];
+    const x = key % W;
+    const y = Math.floor( key / W );
+    const nextDist = goalDist.get( key ) + 1;
+    for ( const dir of Object.keys( DIRS ) ) {
+      const cell = ghostStepCell( grid, x, y, dir );
+      if ( !cell ) continue;
+      const nk = cell.y * W + cell.x;
+      if ( goalDist.has( nk ) ) continue;
+      goalDist.set( nk, nextDist );
+      goalQueue.push( nk );
+    }
+  }
+
+  let bestKey = null;
+  let bestGoalDist = Infinity;
+  let bestDepth = Infinity;
+  for ( const [ key, d ] of depth ) {
+    const gd = goalDist.get( key );
+    if ( gd === undefined ) continue;
+    if ( gd < bestGoalDist || ( gd === bestGoalDist && d < bestDepth ) ) {
+      bestGoalDist = gd;
+      bestDepth = d;
+      bestKey = key;
+    }
+  }
+  if ( bestKey === null || bestKey === startKey ) return fallback();
+
+  while ( prev.get( bestKey ).key !== startKey ) bestKey = prev.get( bestKey ).key;
+  return prev.get( bestKey ).dir;
+}
+
+// Objetivo de cada fantasma, acotado siempre al rango valido del laberinto.
+function ghostTarget( game, g ) {
+  const grid = game.grid;
+  const H = grid.length;
+  const W = grid[ 0 ].length;
+  const p = game.pacman;
+  const px = Math.round( p.x );
+  const py = Math.round( p.y );
+  const pd = DIRS[ p.dir ] || DIRS.left;
+  let tx;
+  let ty;
+
+  if ( g.kind === 'pinky' ) {
+    tx = px + pd.x * 4;
+    ty = py + pd.y * 4;
+  } else if ( g.kind === 'inky' ) {
+    const ax = px + pd.x * 2;
+    const ay = py + pd.y * 2;
+    const blinky = game.ghosts.find( ( other ) => other.kind === 'blinky' ) || p;
+    tx = 2 * ax - Math.round( blinky.x );
+    ty = 2 * ay - Math.round( blinky.y );
+  } else if ( g.kind === 'clyde' ) {
+    const dx = px - Math.round( g.x );
+    const dy = py - Math.round( g.y );
+    const near = Math.sqrt( dx * dx + dy * dy ) <= 8;
+    tx = near ? 1 : px;
+    ty = near ? H - 2 : py;
+  } else {
+    tx = px;
+    ty = py;
+  }
+
+  return {
+    x: Math.max( 0, Math.min( W - 1, Math.round( tx ) ) ),
+    y: Math.max( 0, Math.min( H - 1, Math.round( ty ) ) ),
+  };
+}
+
+function decideGhost( game, g ) {
+  g.dir = shortestPathStep( game.grid, g, ghostTarget( game, g ), g.dir );
 }
 
 function moveGhost( game, g ) {
@@ -197,3 +327,5 @@ function update( game ) {
 window.createGame = createGame;
 window.update = update;
 window.DIRS = DIRS;
+window.shortestPathStep = shortestPathStep;
+window.ghostTarget = ghostTarget;
